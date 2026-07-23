@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
 # Reads the live agent fleet endpoint (the same platform-fleet feed
-# staleness-check.sh reads) and alarms on two per-machine signals that lane
+# staleness-check.sh reads) and alarms on three per-machine signals that lane
 # staleness + convergence don't cover:
 #
-#   1. SECURITY — a machine's updateError indicates a signature-verify
-#      failure (bad-signature / untrusted-key / a signature mismatch). This
-#      posts a DISTINCT, high-priority Discord message, separate from the
-#      routine staleness alarm.
-#   2. STUCK — a machine sits in a non-terminal update phase (staged,
+#   1. SECURITY — a machine's updateError indicates a genuinely tampered or
+#      corrupt manifest (bad-signature / a signature mismatch — the signer's
+#      key IS in our embedded set but the bytes don't verify against it, or
+#      the signature can't even be parsed; plan §2.3.6, saw-agent
+#      internal/update/verify.go VerdictBadSignature, agents-api
+#      IManifestVerifier.cs ManifestVerifyResult.BadSignature). This posts a
+#      DISTINCT, high-priority Discord message, separate from the routine
+#      staleness alarm.
+#   2. OPS (stale key set) — a machine's updateError is untrusted-key: the
+#      signature is well-formed but signed by a key ID our embedded set
+#      doesn't carry — the routine, EXPECTED shape of a machine that hasn't
+#      picked up a key-rotation yet (plan §2.3.6/§2.11, verify.go
+#      VerdictUntrustedKey, IManifestVerifier.cs
+#      ManifestVerifyResult.UntrustedKey: "an ops alert, not a security
+#      page"). During a scheduled key rotation EVERY lagging machine reports
+#      this on every beat — folding it into the security page would page a
+#      security incident per machine and bury/desensitize a real
+#      bad-signature compromise. Posts a separate, lower-priority, distinctly
+#      worded Discord message.
+#   3. STUCK — a machine sits in a non-terminal update phase (staged,
 #      draining, swapping, confirming) with lastUpdateAt older than the
 #      stuck threshold — it started an update and never finished.
 #
@@ -27,12 +42,20 @@ STATE_FILE="${STATE_FILE:-./fleet-health-state.json}"
 RUN_URL="${RUN_URL:-}"
 STUCK_PHASE_MINUTES="${STUCK_PHASE_MINUTES:-30}"
 SECURITY_REALERT_HOURS="${SECURITY_REALERT_HOURS:-6}"
+OPS_REALERT_HOURS="${OPS_REALERT_HOURS:-6}"
 STUCK_REALERT_HOURS="${STUCK_REALERT_HOURS:-6}"
 DISCORD_API_BASE="${DISCORD_API_BASE:-https://discord.com/api/v10}"
-# Case-insensitive; matches the plan's verify-failure vocabulary (§2.3 step 1a,
-# §2.9): `bad-signature` (tampered/corrupt — security event), `untrusted-key`
-# (signed by a key outside the embedded set), or a plain "signature mismatch".
-SECURITY_ERROR_PATTERN="${SECURITY_ERROR_PATTERN:-bad-signature|untrusted-key|signature mismatch|signature verification failed}"
+# Case-insensitive; genuine tamper/corruption only (verify.go
+# VerdictBadSignature / IManifestVerifier.cs BadSignature) — the manifest's
+# signer key IS in our embedded set but the bytes fail Ed25519 verification,
+# or the signature couldn't be parsed at all. Does NOT match untrusted-key
+# (see OPS_ERROR_PATTERN below) — that is a stale key set, not a compromise.
+SECURITY_ERROR_PATTERN="${SECURITY_ERROR_PATTERN:-bad-signature|signature mismatch|signature verification failed}"
+# Case-insensitive; matches ONLY the stale-key-set verdict (verify.go
+# VerdictUntrustedKey / IManifestVerifier.cs UntrustedKey) — a well-formed
+# signature from a key ID outside our embedded set. Routine ops event
+# (rotation lag), never a security page.
+OPS_ERROR_PATTERN="${OPS_ERROR_PATTERN:-untrusted-key}"
 STUCK_PHASES="staged draining swapping confirming"
 
 # --- Self-failure notice (mirrors staleness-check.sh) ----------------------
@@ -141,12 +164,13 @@ fleet_data=$(echo "$fleet_body" | jq -c '.data // .')
 if [ -f "$STATE_FILE" ]; then
   state=$(cat "$STATE_FILE")
 else
-  state='{"security":{},"stuck":{}}'
+  state='{"security":{},"ops":{},"stuck":{}}'
 fi
-# Tolerate a state file from before either key existed.
-new_state=$(echo "$state" | jq -c '{security: (.security // {}), stuck: (.stuck // {})}')
+# Tolerate a state file from before any of these keys existed.
+new_state=$(echo "$state" | jq -c '{security: (.security // {}), ops: (.ops // {}), stuck: (.stuck // {})}')
 
 security_offenders="[]"
+ops_offenders="[]"
 stuck_offenders="[]"
 
 while IFS= read -r machine; do
@@ -157,7 +181,7 @@ while IFS= read -r machine; do
   update_phase=$(echo "$machine" | jq -r '.updatePhase // empty')
   last_update_at=$(echo "$machine" | jq -r '.lastUpdateAt // empty')
 
-  # --- Signal 1: security (signature verify failure) ---
+  # --- Signal 1: security (genuine tamper/corruption — bad-signature) ---
   if [ -n "$update_error" ] && echo "$update_error" | grep -Eiq "$SECURITY_ERROR_PATTERN"; then
     prev_error=$(echo "$new_state" | jq -r --arg id "$machine_id" '.security[$id].error // empty')
     prev_at=$(echo "$new_state" | jq -r --arg id "$machine_id" '.security[$id].alertedAt // empty')
@@ -172,8 +196,26 @@ while IFS= read -r machine; do
       new_state=$(echo "$new_state" | jq --arg id "$machine_id" --arg err "$update_error" --argjson now "$now_epoch" \
         '.security[$id] = {error: $err, alertedAt: $now}')
     fi
-  else
+    new_state=$(echo "$new_state" | jq --arg id "$machine_id" 'del(.ops[$id])')
+  # --- Signal 1b: ops (stale key set — untrusted-key). Routine and expected
+  # during a key rotation window; never a security page. ---
+  elif [ -n "$update_error" ] && echo "$update_error" | grep -Eiq "$OPS_ERROR_PATTERN"; then
+    prev_error=$(echo "$new_state" | jq -r --arg id "$machine_id" '.ops[$id].error // empty')
+    prev_at=$(echo "$new_state" | jq -r --arg id "$machine_id" '.ops[$id].alertedAt // empty')
+    should_alert=true
+    if [ "$prev_error" = "$update_error" ] && [ -n "$prev_at" ]; then
+      hours_since=$(( (now_epoch - prev_at) / 3600 ))
+      [ "$hours_since" -lt "$OPS_REALERT_HOURS" ] && should_alert=false
+    fi
+    if [ "$should_alert" = true ]; then
+      ops_offenders=$(echo "$ops_offenders" | jq --arg id "$machine_id" --arg err "$update_error" --arg tgt "$update_target" \
+        '. + [{machineId: $id, error: $err, target: $tgt}]')
+      new_state=$(echo "$new_state" | jq --arg id "$machine_id" --arg err "$update_error" --argjson now "$now_epoch" \
+        '.ops[$id] = {error: $err, alertedAt: $now}')
+    fi
     new_state=$(echo "$new_state" | jq --arg id "$machine_id" 'del(.security[$id])')
+  else
+    new_state=$(echo "$new_state" | jq --arg id "$machine_id" 'del(.security[$id]) | del(.ops[$id])')
   fi
 
   # --- Signal 2: stuck (non-terminal phase, aged past the stuck threshold) ---
@@ -212,11 +254,13 @@ done < <(echo "$fleet_data" | jq -c '(.machines // [])[]')
 present_ids=$(echo "$fleet_data" | jq -c '[(.machines // [])[].machineId]')
 new_state=$(echo "$new_state" | jq --argjson present "$present_ids" \
   '.security |= with_entries(select(.key as $k | $present | index($k) != null))
+   | .ops |= with_entries(select(.key as $k | $present | index($k) != null))
    | .stuck |= with_entries(select(.key as $k | $present | index($k) != null))')
 
 echo "$new_state" > "$STATE_FILE"
 
 security_count=$(echo "$security_offenders" | jq 'length')
+ops_count=$(echo "$ops_offenders" | jq 'length')
 stuck_count=$(echo "$stuck_offenders" | jq 'length')
 
 # --- Alert (Discord) or stay silent -----------------------------------------
@@ -231,6 +275,16 @@ if [ "$security_count" -gt 0 ]; then
   echo "security alarm posted to discord (${security_count} machine(s))"
 fi
 
+if [ "$ops_count" -gt 0 ]; then
+  lines=("**SAW fleet ops alert (key-rotation lag)**")
+  while IFS= read -r line; do
+    lines+=("$line")
+  done < <(echo "$ops_offenders" | jq -r '.[] | "ℹ️ ops: agent \(.machineId) reported untrusted-key for \(.target) — likely a key-rotation lag; ensure it updates"')
+  [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
+  post_discord "$(printf '%s\n' "${lines[@]}")"
+  echo "ops alarm posted to discord (${ops_count} machine(s))"
+fi
+
 if [ "$stuck_count" -gt 0 ]; then
   lines=("**SAW fleet stuck-phase alert**")
   while IFS= read -r line; do
@@ -241,6 +295,6 @@ if [ "$stuck_count" -gt 0 ]; then
   echo "stuck-phase alarm posted to discord (${stuck_count} machine(s))"
 fi
 
-if [ "$security_count" -eq 0 ] && [ "$stuck_count" -eq 0 ]; then
-  echo "no security or stuck-phase issues detected"
+if [ "$security_count" -eq 0 ] && [ "$ops_count" -eq 0 ] && [ "$stuck_count" -eq 0 ]; then
+  echo "no security, ops, or stuck-phase issues detected"
 fi

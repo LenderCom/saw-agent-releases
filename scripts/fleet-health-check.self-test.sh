@@ -161,7 +161,7 @@ stop_mock_server
 
 scenario_ok=true
 assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
-assert_contains "$output" "no security or stuck-phase issues detected" "stdout" || scenario_ok=false
+assert_contains "$output" "no security, ops, or stuck-phase issues detected" "stdout" || scenario_ok=false
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs received" || scenario_ok=false
 if [ "$scenario_ok" = true ]; then
   echo "    PASS"
@@ -208,7 +208,48 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Scenario 3: a machine has been stuck in `draining` for well over the
+# Scenario 3: a machine reports an untrusted-key updateError (a stale key
+# set — verify.go VerdictUntrustedKey / IManifestVerifier.cs UntrustedKey,
+# plan §2.3.6/§2.11) → the SEPARATE, lower-priority ops alert fires, and the
+# high-priority SECURITY page must NOT.
+# ---------------------------------------------------------------------------
+run_scenario "untrusted-key machine / ops alert, not security"
+port=$(free_port)
+config="${work_dir}/ops.json"
+log_file="${work_dir}/ops.discord.log"
+machines=$(jq -n '[
+  {machineId: "m-stale-key", orgId: "org-f", channel: "dev", agentVersion: "1.3.9", online: true, updatePhase: "failed", updateTarget: "1.4.2", updateError: "verify_failed: untrusted-key (key id not in embedded set)", lastUpdateAt: "2026-07-22T12:00:00Z"}
+]')
+fleet=$(fleet_envelope_with_machines "$machines")
+jq -n --argjson fleet "$fleet" '{
+  "GET /api/v1/platform/agent-fleet": {status: 200, body: $fleet},
+  "POST /channels/999/messages": {status: 200, body: {id: "ops"}}
+}' > "$config"
+start_mock_server "$config" "$port" "$log_file"
+
+result=$(run_check "$port" "$config" "$log_file" "${work_dir}/ops.state.json" "ops")
+exit_code="${result%%$'\x1e'*}"
+output="${result#*$'\x1e'}"
+stop_mock_server
+
+scenario_ok=true
+assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
+assert_contains "$output" "ops alarm posted to discord (1 machine(s))" "stdout" || scenario_ok=false
+assert_not_contains "$output" "security alarm posted to discord" "stdout" || scenario_ok=false
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs received" || scenario_ok=false
+posted_content=$(jq -r '.body.content' "$log_file")
+assert_contains "$posted_content" "SAW fleet ops alert" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "ℹ️ ops: agent m-stale-key reported untrusted-key for 1.4.2 — likely a key-rotation lag; ensure it updates" "posted discord content" || scenario_ok=false
+assert_not_contains "$posted_content" "SECURITY" "posted discord content" || scenario_ok=false
+if [ "$scenario_ok" = true ]; then
+  echo "    PASS"
+  pass_count=$((pass_count + 1))
+else
+  fail_count=$((fail_count + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 4: a machine has been stuck in `draining` for well over the
 # stuck-phase threshold → the stuck alert fires naming machine + phase + age.
 # ---------------------------------------------------------------------------
 run_scenario "stuck draining machine / stuck alert"
@@ -246,7 +287,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Scenario 4: a machine in `confirming` for LESS than the stuck threshold is
+# Scenario 5: a machine in `confirming` for LESS than the stuck threshold is
 # NOT flagged — a normal in-flight update must not page.
 # ---------------------------------------------------------------------------
 run_scenario "in-flight confirming under threshold / silent"
@@ -271,7 +312,7 @@ stop_mock_server
 
 scenario_ok=true
 assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
-assert_contains "$output" "no security or stuck-phase issues detected" "stdout" || scenario_ok=false
+assert_contains "$output" "no security, ops, or stuck-phase issues detected" "stdout" || scenario_ok=false
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs received" || scenario_ok=false
 if [ "$scenario_ok" = true ]; then
   echo "    PASS"
@@ -281,7 +322,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Scenario 5: dedup — the SAME machine + SAME stuck phase alerted last run
+# Scenario 6: dedup — the SAME machine + SAME stuck phase alerted last run
 # (state file already has a recent alertedAt) does not re-page inside the
 # realert window; a NEW distinct machine in the same run still does.
 # ---------------------------------------------------------------------------
@@ -325,7 +366,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Scenario 6: fleet endpoint returns HTTP 500 → the self-failure notice still
+# Scenario 7: fleet endpoint returns HTTP 500 → the self-failure notice still
 # reaches Discord and the run exits non-zero (reuses staleness-check.sh's
 # self-failure mechanism).
 # ---------------------------------------------------------------------------
