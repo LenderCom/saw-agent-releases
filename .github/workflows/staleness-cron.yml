@@ -1,0 +1,44 @@
+name: staleness-cron
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staleness-cron
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore staleness state
+        uses: actions/cache/restore@v4
+        with:
+          path: staleness-state.json
+          key: staleness-state-${{ github.run_id }}
+          restore-keys: |
+            staleness-state-
+
+      - name: Run staleness check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FLEET_KEY: ${{ secrets.SAW_FLEET_STATS_KEY }}
+          DISCORD_BOT_TOKEN: ${{ secrets.SAW_OPS_DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.SAW_OPS_DISCORD_CHANNEL_ID }}
+          STATE_FILE: staleness-state.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: ./scripts/staleness-check.sh
+
+      - name: Save staleness state
+        if: always() && hashFiles('staleness-state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: staleness-state.json
+          key: staleness-state-${{ github.run_id }}
