@@ -1,0 +1,43 @@
+name: fleet-health-cron
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-health-cron
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore fleet-health dedup state
+        uses: actions/cache/restore@v4
+        with:
+          path: fleet-health-state.json
+          key: fleet-health-state-${{ github.run_id }}
+          restore-keys: |
+            fleet-health-state-
+
+      - name: Run fleet health check
+        env:
+          FLEET_KEY: ${{ secrets.SAW_FLEET_STATS_KEY }}
+          DISCORD_BOT_TOKEN: ${{ secrets.SAW_OPS_DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.SAW_OPS_DISCORD_CHANNEL_ID }}
+          STATE_FILE: fleet-health-state.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: ./scripts/fleet-health-check.sh
+
+      - name: Save fleet-health dedup state
+        if: always() && hashFiles('fleet-health-state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: fleet-health-state.json
+          key: fleet-health-state-${{ github.run_id }}
