@@ -14,10 +14,57 @@ STALE_LANE_HOURS="${STALE_LANE_HOURS:-26}"
 CONVERGENCE_WINDOW_HOURS="${CONVERGENCE_WINDOW_HOURS:-24}"
 DISCORD_API_BASE="${DISCORD_API_BASE:-https://discord.com/api/v10}"
 
+# --- Self-failure notice ---------------------------------------------------
+# The whole point of this script is to be the thing that notices problems. If
+# IT crashes (bad HTTP status, a malformed response, anything under set -e),
+# that failure must not be invisible — post a distinct, low-noise "the alarm
+# itself is broken" message using the same Discord secrets, then still exit
+# non-zero so Actions shows red. If the Discord secrets are themselves what's
+# missing, there's nothing to post with — a plain loud exit 1 is acceptable.
+notified_self_failure=false
+
+notify_self_failure() {
+  local reason="$1"
+  [ "$notified_self_failure" = true ] && return 0
+  notified_self_failure=true
+
+  if [ -z "${DISCORD_BOT_TOKEN:-}" ] || [ -z "${DISCORD_CHANNEL_ID:-}" ]; then
+    echo "NOTE: cannot post a self-failure notice — DISCORD_BOT_TOKEN/DISCORD_CHANNEL_ID not set" >&2
+    return 0
+  fi
+
+  local text="**staleness-check itself failed**: ${reason}"
+  [ -n "${RUN_URL:-}" ] && text="${text}
+Run: ${RUN_URL}"
+
+  local payload notice_status
+  payload=$(jq -n --arg content "$text" '{content: $content}' 2>/dev/null) || return 0
+  notice_status=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -X POST -d "$payload" \
+    "${DISCORD_API_BASE}/channels/${DISCORD_CHANNEL_ID}/messages" 2>/dev/null) || true
+  if [ "${notice_status:-}" != "" ] && [ "${notice_status}" -ge 300 ] 2>/dev/null; then
+    echo "NOTE: self-failure Discord notice itself got HTTP ${notice_status} — giving up, exiting red anyway" >&2
+  fi
+}
+
 fail() {
   echo "ERROR: $*" >&2
+  notify_self_failure "$*"
   exit 1
 }
+
+# Catches anything that dies via `set -e` without going through fail() (an
+# unhandled curl/jq failure, a bad substitution, etc.) so a crash is never
+# silently red with no trace of *why* the alarm mechanism itself went dark.
+on_unexpected_error() {
+  local lineno="$1" cmd="$2"
+  echo "ERROR: unexpected failure at line ${lineno}: ${cmd}" >&2
+  notify_self_failure "unexpected failure at line ${lineno} running: ${cmd}"
+  exit 1
+}
+trap 'on_unexpected_error "$LINENO" "$BASH_COMMAND"' ERR
 
 require_env() {
   local var_name="$1" secret_name="$2"
@@ -94,7 +141,19 @@ if [ "$fleet_status" != "200" ]; then
   fail "fleet endpoint ${FLEET_ENDPOINT} returned HTTP ${fleet_status}: ${fleet_body}"
 fi
 
-fleet_head_version=$(echo "$fleet_body" | jq -r '[.channels[] | select(.channel == "dev")][0].headVersion // empty')
+# The real endpoint wraps the payload in an Envelope: {ok, data: {channels,
+# machines}}. Unwrap defensively (.data // .) so an eventual unwrapped shape
+# still works, and assert `ok` up front — a well-formed-but-failed envelope
+# (ok:false) must not silently look like an empty fleet.
+fleet_ok=$(echo "$fleet_body" | jq -r 'if has("ok") then (.ok | tostring) else "true" end' 2>/dev/null) || fail "fleet endpoint ${FLEET_ENDPOINT} returned non-JSON body: ${fleet_body}"
+if [ "$fleet_ok" != "true" ]; then
+  fleet_error=$(echo "$fleet_body" | jq -r '.error // .message // "no error detail in envelope"')
+  fail "fleet endpoint ${FLEET_ENDPOINT} returned ok=false: ${fleet_error}"
+fi
+
+fleet_data=$(echo "$fleet_body" | jq -c '.data // .')
+
+fleet_head_version=$(echo "$fleet_data" | jq -r '[(.channels // [])[] | select(.channel == "dev")][0].headVersion // empty')
 
 # --- Step 3: fleet-not-converging (machines stuck behind the fleet's own dev head) ---
 
@@ -130,9 +189,9 @@ if [ -n "$fleet_head_version" ]; then
       offending=$(echo "$offending" | jq --arg id "$machine_id" --arg v "$agent_version" --argjson h "$behind_hours" \
         '. + [{machineId: $id, agentVersion: $v, behindHours: $h}]')
     fi
-  done < <(echo "$fleet_body" | jq -c '.machines[] | select(.online == true and .channel == "dev")')
+  done < <(echo "$fleet_data" | jq -c '(.machines // [])[] | select(.online == true and .channel == "dev")')
 
-  present_ids=$(echo "$fleet_body" | jq -c '[.machines[].machineId]')
+  present_ids=$(echo "$fleet_data" | jq -c '[(.machines // [])[].machineId]')
   new_state=$(echo "$new_state" | jq --argjson present "$present_ids" \
     'with_entries(select(.key as $k | $present | index($k) != null))')
 
