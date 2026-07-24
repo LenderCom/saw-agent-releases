@@ -98,6 +98,32 @@ fleet_envelope() {
   }'
 }
 
+# Same as fleet_envelope but with a desktop-dev channel head + one desktop
+# machine's appVersion/appChannel added — for the P1-H desktop staleness
+# extension. The agent-side dev channel/machine stays healthy/converged so
+# each scenario isolates the desktop signal it's testing.
+fleet_envelope_with_desktop() {
+  local head_version="$1" machine_version="$2" online="$3"
+  local desktop_head_version="$4" desktop_head_published_iso="$5"
+  local desktop_machine_id="$6" desktop_app_version="$7" desktop_online="$8"
+  jq -n --arg hv "$head_version" --arg mv "$machine_version" --argjson online "$online" \
+    --arg dhv "$desktop_head_version" --arg dpub "$desktop_head_published_iso" \
+    --arg dmid "$desktop_machine_id" --arg dav "$desktop_app_version" --argjson donline "$desktop_online" '{
+    ok: true,
+    data: {
+      channels: [
+        {channel: "dev", headVersion: $hv},
+        {channel: "stable", headVersion: "1.0.0"},
+        {channel: "desktop-dev", headVersion: $dhv, headPublishedAt: $dpub}
+      ],
+      machines: [
+        {machineId: "m-aaa", agentVersion: $mv, online: $online, channel: "dev"},
+        {machineId: $dmid, appVersion: $dav, appChannel: "desktop-dev", online: $donline, channel: "dev"}
+      ]
+    }
+  }'
+}
+
 release_list() {
   local version="$1" published_iso="$2" manifest_url="$3"
   jq -n --arg v "$version" --arg pub "$published_iso" --arg url "$manifest_url" '[{
@@ -330,6 +356,158 @@ stop_mock_server
 scenario_ok=true
 assert_eq "$exit_code" "1" "exit code" || scenario_ok=false
 assert_contains "$output" "cannot post a self-failure notice" "stdout" || scenario_ok=false
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs received" || scenario_ok=false
+if [ "$scenario_ok" = true ]; then
+  echo "    PASS"
+  pass_count=$((pass_count + 1))
+else
+  fail_count=$((fail_count + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 6 (P1-H): desktop channel head is stale (no publish in threshold
+# window) — alarm posted, agent-dev side stays healthy/silent so only the
+# desktop-lane path fires.
+# ---------------------------------------------------------------------------
+run_scenario "desktop head stale / alarm"
+port=$(free_port)
+config="${work_dir}/desktop_stale_head.json"
+log_file="${work_dir}/desktop_stale_head.discord.log"
+manifest_url="http://127.0.0.1:${port}/manifest/dev-v0.9.1.json"
+releases=$(release_list "0.9.1" "$(epoch_to_iso $((now_epoch - 3600)))" "$manifest_url")
+manifest=$(manifest_body "0.9.1")
+fleet=$(fleet_envelope_with_desktop "0.9.1" "0.9.1" true \
+  "0.4.0" "$(epoch_to_iso $((now_epoch - 30 * 3600)))" "m-desktop-1" "0.4.0" true)
+jq -n --argjson releases "$releases" --argjson manifest "$manifest" --argjson fleet "$fleet" '{
+  "GET /repos/LenderCom/saw-agent-releases/releases": {status: 200, body: $releases},
+  "GET /manifest/dev-v0.9.1.json": {status: 200, body: $manifest},
+  "GET /api/v1/platform/agent-fleet": {status: 200, body: $fleet},
+  "POST /channels/999/messages": {status: 200, body: {id: "6"}}
+}' > "$config"
+start_mock_server "$config" "$port" "$log_file"
+
+set +e
+output=$(cd "$work_dir" && GITHUB_API_BASE="http://127.0.0.1:${port}" \
+  FLEET_ENDPOINT="http://127.0.0.1:${port}/api/v1/platform/agent-fleet" \
+  DISCORD_API_BASE="http://127.0.0.1:${port}" \
+  FLEET_KEY="test-fleet-key" \
+  DISCORD_BOT_TOKEN="test-bot-token" DISCORD_CHANNEL_ID="999" \
+  STATE_FILE="${work_dir}/desktop_stale_head.state.json" \
+  DESKTOP_STATE_FILE="${work_dir}/desktop_stale_head.desktop-state.json" \
+  RUN_URL="http://example.invalid/run/6" \
+  "$target_script" 2>&1)
+exit_code=$?
+set -e
+stop_mock_server
+
+scenario_ok=true
+assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
+assert_contains "$output" "alarm posted to discord" "stdout" || scenario_ok=false
+posted_content=$(jq -r '.body.content' "$log_file")
+assert_contains "$posted_content" "Desktop lane:" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "desktop channel desktop-dev head 0.4.0" "posted discord content" || scenario_ok=false
+if [ "$scenario_ok" = true ]; then
+  echo "    PASS"
+  pass_count=$((pass_count + 1))
+else
+  fail_count=$((fail_count + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 7 (P1-H, the ticket's own exit criterion): a synthetic
+# behind-head desktop fleet fires one alarm. The desktop head is fresh (no
+# lane-staleness), but a desktop machine has been sitting on an older
+# appVersion since well past CONVERGENCE_WINDOW_HOURS — pre-seed
+# DESKTOP_STATE_FILE with that machine's firstBehindAt so a single run
+# crosses the threshold (mirrors how the agent-side convergence window is
+# only observable across runs).
+# ---------------------------------------------------------------------------
+run_scenario "desktop fleet trails head / alarm"
+port=$(free_port)
+config="${work_dir}/desktop_behind.json"
+log_file="${work_dir}/desktop_behind.discord.log"
+manifest_url="http://127.0.0.1:${port}/manifest/dev-v0.9.1.json"
+releases=$(release_list "0.9.1" "$(epoch_to_iso $((now_epoch - 3600)))" "$manifest_url")
+manifest=$(manifest_body "0.9.1")
+fleet=$(fleet_envelope_with_desktop "0.9.1" "0.9.1" true \
+  "0.5.0" "$(epoch_to_iso $((now_epoch - 3600)))" "m-desktop-2" "0.4.0" true)
+jq -n --argjson releases "$releases" --argjson manifest "$manifest" --argjson fleet "$fleet" '{
+  "GET /repos/LenderCom/saw-agent-releases/releases": {status: 200, body: $releases},
+  "GET /manifest/dev-v0.9.1.json": {status: 200, body: $manifest},
+  "GET /api/v1/platform/agent-fleet": {status: 200, body: $fleet},
+  "POST /channels/999/messages": {status: 200, body: {id: "7"}}
+}' > "$config"
+start_mock_server "$config" "$port" "$log_file"
+
+desktop_state_file="${work_dir}/desktop_behind.desktop-state.json"
+jq -n --argjson at "$((now_epoch - 30 * 3600))" '{"m-desktop-2": {firstBehindAt: $at, version: "0.4.0"}}' > "$desktop_state_file"
+
+set +e
+output=$(cd "$work_dir" && GITHUB_API_BASE="http://127.0.0.1:${port}" \
+  FLEET_ENDPOINT="http://127.0.0.1:${port}/api/v1/platform/agent-fleet" \
+  DISCORD_API_BASE="http://127.0.0.1:${port}" \
+  FLEET_KEY="test-fleet-key" \
+  DISCORD_BOT_TOKEN="test-bot-token" DISCORD_CHANNEL_ID="999" \
+  STATE_FILE="${work_dir}/desktop_behind.state.json" \
+  DESKTOP_STATE_FILE="$desktop_state_file" \
+  RUN_URL="http://example.invalid/run/7" \
+  "$target_script" 2>&1)
+exit_code=$?
+set -e
+stop_mock_server
+
+scenario_ok=true
+assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
+assert_contains "$output" "alarm posted to discord" "stdout" || scenario_ok=false
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs received" || scenario_ok=false
+posted_content=$(jq -r '.body.content' "$log_file")
+assert_contains "$posted_content" "Desktop machines not converging" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "m-desktop-2 stuck on 0.4.0" "posted discord content" || scenario_ok=false
+if [ "$scenario_ok" = true ]; then
+  echo "    PASS"
+  pass_count=$((pass_count + 1))
+else
+  fail_count=$((fail_count + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 8 (P1-H): desktop channel absent from the fleet response (not yet
+# onboarded on this environment) must NOT alarm — "omitted = unchanged".
+# ---------------------------------------------------------------------------
+run_scenario "desktop channel absent / silent"
+port=$(free_port)
+config="${work_dir}/no_desktop.json"
+log_file="${work_dir}/no_desktop.discord.log"
+manifest_url="http://127.0.0.1:${port}/manifest/dev-v0.9.1.json"
+releases=$(release_list "0.9.1" "$(epoch_to_iso $((now_epoch - 3600)))" "$manifest_url")
+manifest=$(manifest_body "0.9.1")
+fleet=$(fleet_envelope "0.9.1" "0.9.1" true)
+jq -n --argjson releases "$releases" --argjson manifest "$manifest" --argjson fleet "$fleet" '{
+  "GET /repos/LenderCom/saw-agent-releases/releases": {status: 200, body: $releases},
+  "GET /manifest/dev-v0.9.1.json": {status: 200, body: $manifest},
+  "GET /api/v1/platform/agent-fleet": {status: 200, body: $fleet},
+  "POST /channels/999/messages": {status: 200, body: {id: "8"}}
+}' > "$config"
+start_mock_server "$config" "$port" "$log_file"
+
+set +e
+output=$(cd "$work_dir" && GITHUB_API_BASE="http://127.0.0.1:${port}" \
+  FLEET_ENDPOINT="http://127.0.0.1:${port}/api/v1/platform/agent-fleet" \
+  DISCORD_API_BASE="http://127.0.0.1:${port}" \
+  FLEET_KEY="test-fleet-key" \
+  DISCORD_BOT_TOKEN="test-bot-token" DISCORD_CHANNEL_ID="999" \
+  STATE_FILE="${work_dir}/no_desktop.state.json" \
+  DESKTOP_STATE_FILE="${work_dir}/no_desktop.desktop-state.json" \
+  RUN_URL="http://example.invalid/run/8" \
+  "$target_script" 2>&1)
+exit_code=$?
+set -e
+stop_mock_server
+
+scenario_ok=true
+assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
+assert_contains "$output" "no staleness detected" "stdout" || scenario_ok=false
+assert_contains "$output" "desktop head none" "stdout" || scenario_ok=false
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs received" || scenario_ok=false
 if [ "$scenario_ok" = true ]; then
   echo "    PASS"

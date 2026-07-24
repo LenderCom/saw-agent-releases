@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # Compares this repo's own newest non-yanked dev-v* release against the live
 # agent fleet endpoint and alerts to Discord when the dev lane looks stalled
-# or the fleet isn't converging to it. Callable standalone (curl+jq only) or
-# from the staleness-cron workflow.
+# or the fleet isn't converging to it. Also covers the desktop-app-update
+# plan's fleet §2.4 extension: the SAME fleet endpoint's desktop channel head
+# (from ChannelManifest, surfaced via P1-F) and per-machine appVersion
+# histogram, on the same 6-hourly cadence and the same alarm/threshold path —
+# a separate state file only (desktop machines track a different "behind"
+# clock than agent machines, so the two must not share firstBehindAt keys).
+# Callable standalone (curl+jq only) or from the staleness-cron workflow.
 set -euo pipefail
 
 REPO="${GITHUB_REPOSITORY:-LenderCom/saw-agent-releases}"
 GITHUB_API_BASE="${GITHUB_API_BASE:-https://api.github.com}"
 FLEET_ENDPOINT="${FLEET_ENDPOINT:-https://agents.dev.sawrun.com/api/v1/platform/agent-fleet}"
 STATE_FILE="${STATE_FILE:-./staleness-state.json}"
+DESKTOP_STATE_FILE="${DESKTOP_STATE_FILE:-./desktop-staleness-state.json}"
+DESKTOP_CHANNEL="${DESKTOP_CHANNEL:-desktop-dev}"
 RUN_URL="${RUN_URL:-}"
 STALE_LANE_HOURS="${STALE_LANE_HOURS:-26}"
 CONVERGENCE_WINDOW_HOURS="${CONVERGENCE_WINDOW_HOURS:-24}"
@@ -204,9 +211,84 @@ if [ "$(echo "$stale_machines" | jq 'length')" -gt 0 ]; then
   fleet_not_converging=true
 fi
 
-# --- Step 4: alert (Discord) or stay silent -------------------------------
+# --- Step 4: desktop channel head (read directly off the SAME fleet
+# endpoint — the ChannelManifest projection already carries the desktop
+# channel's verified head + publish time, so no second GitHub-releases
+# lookup against a separate repo is needed). An absent channel row (the
+# desktop channel not yet onboarded on this environment) is NOT an alarm —
+# "omitted = unchanged", the same discipline the telemetry wire uses. -------
 
-if [ "$lane_stale" = true ] || [ "$fleet_not_converging" = true ]; then
+desktop_head_version=$(echo "$fleet_data" | jq -r --arg ch "$DESKTOP_CHANNEL" \
+  '[(.channels // [])[] | select(.channel == $ch)][0].headVersion // empty')
+desktop_head_published_at=$(echo "$fleet_data" | jq -r --arg ch "$DESKTOP_CHANNEL" \
+  '[(.channels // [])[] | select(.channel == $ch)][0].headPublishedAt // empty')
+
+desktop_head_stale=false
+desktop_head_reason=""
+if [ -n "$desktop_head_version" ] && [ -n "$desktop_head_published_at" ]; then
+  desktop_head_epoch=$(iso_to_epoch "$desktop_head_published_at")
+  desktop_head_age_hours=$(( (now_epoch - desktop_head_epoch) / 3600 ))
+  if [ "$desktop_head_age_hours" -ge "$STALE_LANE_HOURS" ]; then
+    desktop_head_stale=true
+    desktop_head_reason="desktop channel ${DESKTOP_CHANNEL} head ${desktop_head_version} published ${desktop_head_age_hours}h ago (threshold ${STALE_LANE_HOURS}h)"
+  fi
+fi
+
+# --- Step 5: desktop fleet-not-converging (machines stuck behind the
+# desktop head) — mirrors Step 3 exactly, over appVersion/appChannel instead
+# of agentVersion/channel, in its OWN state file so a machine's agent-behind
+# clock and app-behind clock never collide under the same id. -------------
+
+desktop_stale_machines="[]"
+if [ -n "$desktop_head_version" ]; then
+  if [ -f "$DESKTOP_STATE_FILE" ]; then
+    desktop_state=$(cat "$DESKTOP_STATE_FILE")
+  else
+    desktop_state='{}'
+  fi
+  new_desktop_state="$desktop_state"
+  desktop_offending="[]"
+
+  while IFS= read -r machine; do
+    [ -z "$machine" ] && continue
+    machine_id=$(echo "$machine" | jq -r '.machineId')
+    app_version=$(echo "$machine" | jq -r '.appVersion // "unknown"')
+
+    if [ "$app_version" = "$desktop_head_version" ]; then
+      new_desktop_state=$(echo "$new_desktop_state" | jq --arg id "$machine_id" 'del(.[$id])')
+      continue
+    fi
+
+    first_behind=$(echo "$new_desktop_state" | jq -r --arg id "$machine_id" '.[$id].firstBehindAt // empty')
+    if [ -z "$first_behind" ]; then
+      new_desktop_state=$(echo "$new_desktop_state" | jq --arg id "$machine_id" --arg v "$app_version" --argjson now "$now_epoch" \
+        '.[$id] = {firstBehindAt: $now, version: $v}')
+      first_behind="$now_epoch"
+    fi
+
+    behind_hours=$(( (now_epoch - first_behind) / 3600 ))
+    if [ "$behind_hours" -ge "$CONVERGENCE_WINDOW_HOURS" ]; then
+      desktop_offending=$(echo "$desktop_offending" | jq --arg id "$machine_id" --arg v "$app_version" --argjson h "$behind_hours" \
+        '. + [{machineId: $id, appVersion: $v, behindHours: $h}]')
+    fi
+  done < <(echo "$fleet_data" | jq -c --arg ch "$DESKTOP_CHANNEL" '(.machines // [])[] | select(.online == true and .appChannel == $ch)')
+
+  present_ids=$(echo "$fleet_data" | jq -c '[(.machines // [])[].machineId]')
+  new_desktop_state=$(echo "$new_desktop_state" | jq --argjson present "$present_ids" \
+    'with_entries(select(.key as $k | $present | index($k) != null))')
+
+  echo "$new_desktop_state" > "$DESKTOP_STATE_FILE"
+  desktop_stale_machines="$desktop_offending"
+fi
+
+desktop_fleet_not_converging=false
+if [ "$(echo "$desktop_stale_machines" | jq 'length')" -gt 0 ]; then
+  desktop_fleet_not_converging=true
+fi
+
+# --- Step 6: alert (Discord) or stay silent -------------------------------
+
+if [ "$lane_stale" = true ] || [ "$fleet_not_converging" = true ] || [ "$desktop_head_stale" = true ] || [ "$desktop_fleet_not_converging" = true ]; then
   require_env DISCORD_BOT_TOKEN SAW_OPS_DISCORD_BOT_TOKEN
   require_env DISCORD_CHANNEL_ID SAW_OPS_DISCORD_CHANNEL_ID
 
@@ -220,6 +302,18 @@ if [ "$lane_stale" = true ] || [ "$fleet_not_converging" = true ]; then
     while IFS= read -r line; do
       lines+=("$line")
     done < <(echo "$stale_machines" | jq -r '.[] | "  - \(.machineId) stuck on \(.agentVersion) for \(.behindHours)h"')
+  fi
+  if [ "$desktop_head_stale" = true ]; then
+    lines+=("- Desktop lane: ${desktop_head_reason}")
+  fi
+  if [ -n "$desktop_head_version" ]; then
+    lines+=("- Fleet desktop head (${DESKTOP_CHANNEL}, per fleet endpoint): ${desktop_head_version}")
+  fi
+  if [ "$desktop_fleet_not_converging" = true ]; then
+    lines+=("- Desktop machines not converging to head (>= ${CONVERGENCE_WINDOW_HOURS}h behind):")
+    while IFS= read -r line; do
+      lines+=("$line")
+    done < <(echo "$desktop_stale_machines" | jq -r '.[] | "  - \(.machineId) stuck on \(.appVersion) for \(.behindHours)h"')
   fi
   if [ -n "$RUN_URL" ]; then
     lines+=("Run: ${RUN_URL}")
@@ -237,7 +331,7 @@ if [ "$lane_stale" = true ] || [ "$fleet_not_converging" = true ]; then
     fail "discord alert POST failed with HTTP ${discord_status}: $(cat "$discord_response_file")"
   fi
   rm -f "$discord_response_file"
-  echo "alarm posted to discord (lane_stale=${lane_stale} fleet_not_converging=${fleet_not_converging})"
+  echo "alarm posted to discord (lane_stale=${lane_stale} fleet_not_converging=${fleet_not_converging} desktop_head_stale=${desktop_head_stale} desktop_fleet_not_converging=${desktop_fleet_not_converging})"
 else
-  echo "no staleness detected — dev head ${head_version:-none}, fleet dev head ${fleet_head_version:-unknown}, all online dev machines converged"
+  echo "no staleness detected — dev head ${head_version:-none}, fleet dev head ${fleet_head_version:-unknown}, all online dev machines converged; desktop head ${desktop_head_version:-none (channel not yet onboarded)}"
 fi
