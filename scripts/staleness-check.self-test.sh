@@ -517,24 +517,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Scenarios 9 and 10 (SAW-4106): a dev build on the stable channel is frozen, so it
-# alarms; a stable build on stable is on its own lane and does not.
+# Scenarios 9 to 12 (SAW-4106): a dev build on the stable channel is frozen, so it
+# alarms and says why; a stable build on stable is on its own lane and does not; a
+# machine on the dev channel behind head alarms as plainly stuck, whatever it runs.
 # ---------------------------------------------------------------------------
-stable_channel_scenario() {
-  local name="$1" machine_version="$2" expect_alarm="$3"
+machine_channel_scenario() {
+  local name="$1" machine_version="$2" machine_channel="$3" expect_line="$4"
   run_scenario "$name"
-  local port config log_file manifest_url releases manifest fleet output exit_code
+  local port case_id config log_file manifest_url releases manifest fleet output exit_code
   port=$(free_port)
-  config="${work_dir}/${expect_alarm}-stable.json"
-  log_file="${work_dir}/${expect_alarm}-stable.discord.log"
+  case_id="${machine_channel}-${machine_version}"
+  config="${work_dir}/${case_id}.json"
+  log_file="${work_dir}/${case_id}.discord.log"
   manifest_url="http://127.0.0.1:${port}/manifest/dev-v0.9.1.json"
   releases=$(release_list "0.9.1" "$(epoch_to_iso $((now_epoch - 3600)))" "$manifest_url")
   manifest=$(manifest_body "0.9.1")
-  fleet=$(jq -n --arg mv "$machine_version" '{
+  fleet=$(jq -n --arg mv "$machine_version" --arg mc "$machine_channel" '{
     ok: true,
     data: {
       channels: [{channel: "dev", headVersion: "0.9.1"}, {channel: "stable", headVersion: "0.1.2"}],
-      machines: [{machineId: "m-frozen", agentVersion: $mv, online: true, channel: "stable"}]
+      machines: [{machineId: "m-frozen", agentVersion: $mv, online: true, channel: $mc}]
     }
   }')
   jq -n --argjson releases "$releases" --argjson manifest "$manifest" --argjson fleet "$fleet" '{
@@ -552,8 +554,8 @@ stable_channel_scenario() {
     FLEET_KEY="test-fleet-key" \
     DISCORD_BOT_TOKEN="test-bot-token" DISCORD_CHANNEL_ID="999" \
     CONVERGENCE_WINDOW_HOURS=0 \
-    STATE_FILE="${work_dir}/${expect_alarm}-stable.state.json" \
-    DESKTOP_STATE_FILE="${work_dir}/${expect_alarm}-stable.desktop-state.json" \
+    STATE_FILE="${work_dir}/${case_id}.state.json" \
+    DESKTOP_STATE_FILE="${work_dir}/${case_id}.desktop-state.json" \
     RUN_URL="http://example.invalid/run/9" \
     "$target_script" 2>&1)
   exit_code=$?
@@ -562,11 +564,11 @@ stable_channel_scenario() {
 
   scenario_ok=true
   assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
-  if [ "$expect_alarm" = alarm ]; then
+  if [ -n "$expect_line" ]; then
     assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs received" || scenario_ok=false
-    assert_contains "$(jq -r '.body.content' "$log_file")" \
-      "m-frozen stuck on ${machine_version} for 0h (a dev build on the stable channel, which offers it no update)" \
-      "posted discord content" || scenario_ok=false
+    # The whole line, so a suffix it should not carry fails as surely as one it lacks.
+    assert_eq "$(jq -r '.body.content' "$log_file" | grep 'm-frozen' || true)" "  - ${expect_line}" \
+      "posted machine line" || scenario_ok=false
   else
     assert_contains "$output" "no staleness detected" "stdout" || scenario_ok=false
     assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs received" || scenario_ok=false
@@ -578,8 +580,13 @@ stable_channel_scenario() {
     fail_count=$((fail_count + 1))
   fi
 }
-stable_channel_scenario "dev build on the stable channel / alarm" "0.1.3-dev.2438+g95a2e85c" alarm
-stable_channel_scenario "stable build on the stable channel / silent" "0.1.2" silent
+machine_channel_scenario "dev build on the stable channel / alarm" "0.1.3-dev.2438+g95a2e85c" stable \
+  "m-frozen stuck on 0.1.3-dev.2438+g95a2e85c for 0h (a dev build on the stable channel, which offers it no update)"
+machine_channel_scenario "stable build on the stable channel / silent" "0.1.2" stable ""
+machine_channel_scenario "dev build on the dev channel behind head / alarm" "0.9.1-dev.7+gabc1234" dev \
+  "m-frozen stuck on 0.9.1-dev.7+gabc1234 for 0h"
+machine_channel_scenario "stable build on the dev channel behind head / alarm" "0.1.2" dev \
+  "m-frozen stuck on 0.1.2 for 0h"
 
 echo "== ${pass_count} passed, ${fail_count} failed =="
 [ "$fail_count" -eq 0 ]
