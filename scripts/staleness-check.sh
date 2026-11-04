@@ -163,6 +163,10 @@ fleet_data=$(echo "$fleet_body" | jq -c '.data // .')
 fleet_head_version=$(echo "$fleet_data" | jq -r '[(.channels // [])[] | select(.channel == "dev")][0].headVersion // empty')
 
 # --- Step 3: fleet-not-converging (machines stuck behind the fleet's own dev head) ---
+# A dev build on another channel counts too (SAW-4106): stable's head is older than
+# any dev build, so that machine is offered no update at all and stays frozen. Claude9
+# sat like that for six days, losing 20 minutes per heavy leg to a fixed bug, with this
+# alarm blind to it. A stable build on stable is on its own lane and is left alone.
 
 stale_machines="[]"
 if [ -n "$fleet_head_version" ]; then
@@ -178,6 +182,7 @@ if [ -n "$fleet_head_version" ]; then
     [ -z "$machine" ] && continue
     machine_id=$(echo "$machine" | jq -r '.machineId')
     agent_version=$(echo "$machine" | jq -r '.agentVersion // "unknown"')
+    machine_channel=$(echo "$machine" | jq -r '.channel // "unknown"')
 
     if [ "$agent_version" = "$fleet_head_version" ]; then
       new_state=$(echo "$new_state" | jq --arg id "$machine_id" 'del(.[$id])')
@@ -193,10 +198,10 @@ if [ -n "$fleet_head_version" ]; then
 
     behind_hours=$(( (now_epoch - first_behind) / 3600 ))
     if [ "$behind_hours" -ge "$CONVERGENCE_WINDOW_HOURS" ]; then
-      offending=$(echo "$offending" | jq --arg id "$machine_id" --arg v "$agent_version" --argjson h "$behind_hours" \
-        '. + [{machineId: $id, agentVersion: $v, behindHours: $h}]')
+      offending=$(echo "$offending" | jq --arg id "$machine_id" --arg v "$agent_version" --arg c "$machine_channel" --argjson h "$behind_hours" \
+        '. + [{machineId: $id, agentVersion: $v, channel: $c, behindHours: $h}]')
     fi
-  done < <(echo "$fleet_data" | jq -c '(.machines // [])[] | select(.online == true and .channel == "dev")')
+  done < <(echo "$fleet_data" | jq -c '(.machines // [])[] | select(.online == true and (.channel == "dev" or ((.agentVersion // "") | test("-dev\\."))))')
 
   present_ids=$(echo "$fleet_data" | jq -c '[(.machines // [])[].machineId]')
   new_state=$(echo "$new_state" | jq --argjson present "$present_ids" \
@@ -301,7 +306,7 @@ if [ "$lane_stale" = true ] || [ "$fleet_not_converging" = true ] || [ "$desktop
     lines+=("- Machines not converging to head (>= ${CONVERGENCE_WINDOW_HOURS}h behind):")
     while IFS= read -r line; do
       lines+=("$line")
-    done < <(echo "$stale_machines" | jq -r '.[] | "  - \(.machineId) stuck on \(.agentVersion) for \(.behindHours)h"')
+    done < <(echo "$stale_machines" | jq -r '.[] | "  - \(.machineId) stuck on \(.agentVersion) for \(.behindHours)h" + (if .channel == "dev" then "" else " (a dev build on the \(.channel) channel, which offers it no update)" end)')
   fi
   if [ "$desktop_head_stale" = true ]; then
     lines+=("- Desktop lane: ${desktop_head_reason}")
