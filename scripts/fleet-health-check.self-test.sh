@@ -161,7 +161,7 @@ stop_mock_server
 
 scenario_ok=true
 assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
-assert_contains "$output" "no security, ops, or stuck-phase issues detected" "stdout" || scenario_ok=false
+assert_contains "$output" "no security, ops, stuck-phase, frozen-channel, or pinned-machine issues detected" "stdout" || scenario_ok=false
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs received" || scenario_ok=false
 if [ "$scenario_ok" = true ]; then
   echo "    PASS"
@@ -312,7 +312,7 @@ stop_mock_server
 
 scenario_ok=true
 assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
-assert_contains "$output" "no security, ops, or stuck-phase issues detected" "stdout" || scenario_ok=false
+assert_contains "$output" "no security, ops, stuck-phase, frozen-channel, or pinned-machine issues detected" "stdout" || scenario_ok=false
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs received" || scenario_ok=false
 if [ "$scenario_ok" = true ]; then
   echo "    PASS"
@@ -397,6 +397,112 @@ if [ "$scenario_ok" = true ]; then
 else
   fail_count=$((fail_count + 1))
 fi
+
+finish_scenario() {
+  if [ "$scenario_ok" = true ]; then
+    echo "    PASS"
+    pass_count=$((pass_count + 1))
+  else
+    fail_count=$((fail_count + 1))
+  fi
+}
+
+# Runs the check against a {channels, machines} fixture. Sets exit_code, output,
+# log_file. The state file is named by the scenario, so a second run with the same
+# name sees the first run's dedup state.
+run_fleet() {
+  local name="$1" fleet_data="$2"
+  local port config
+  port=$(free_port)
+  config="${work_dir}/${name}.json"
+  log_file="${work_dir}/${name}.discord.log"
+  : > "$log_file"
+  jq -n --argjson data "$fleet_data" '{
+    "GET /api/v1/platform/agent-fleet": {status: 200, body: {ok: true, data: $data}},
+    "POST /channels/999/messages": {status: 200, body: {id: "1"}}
+  }' > "$config"
+  start_mock_server "$config" "$port" "$log_file"
+  local result
+  result=$(run_check "$port" "$config" "$log_file" "${work_dir}/${name}.state.json" "$name")
+  exit_code="${result%%$'\x1e'*}"
+  output="${result#*$'\x1e'}"
+  stop_mock_server
+}
+
+run_scenario "frozen channel / alerts once, then again for a new target"
+scenario_ok=true
+frozen_fleet() {
+  jq -n --arg target "$1" '{channels: [
+    {channel: "dev", headVersion: $target, frozenTargetVersion: $target, frozenAt: "2026-11-04T17:31:20Z", frozenReason: "2 distinct machines reported a terminal update failure"},
+    {channel: "stable", headVersion: "1.0.0", frozenTargetVersion: null}
+  ], machines: []}'
+}
+run_fleet frozen "$(frozen_fleet 1.4.2)"
+assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
+assert_contains "$output" "frozen-channel alarm posted to discord (1 channel(s))" "stdout" || scenario_ok=false
+posted_content=$(jq -r '.body.content' "$log_file")
+assert_contains "$posted_content" "frozen: channel dev at 1.4.2" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "2 distinct machines" "posted discord content" || scenario_ok=false
+assert_not_contains "$posted_content" "channel stable" "posted discord content" || scenario_ok=false
+run_fleet frozen "$(frozen_fleet 1.4.2)"
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs on the deduped re-run" || scenario_ok=false
+assert_contains "$output" "no security, ops, stuck-phase, frozen-channel, or pinned-machine issues detected" "stdout" || scenario_ok=false
+run_fleet frozen "$(frozen_fleet 1.4.3)"
+assert_contains "$output" "frozen-channel alarm posted to discord (1 channel(s))" "stdout on a new target" || scenario_ok=false
+finish_scenario
+
+run_scenario "frozen channel lifted, then frozen again at the same target / alerts afresh"
+scenario_ok=true
+run_fleet refrozen "$(frozen_fleet 1.4.2)"
+run_fleet refrozen "$(jq -n '{channels: [{channel: "dev", headVersion: "1.4.3", frozenTargetVersion: null}], machines: []}')"
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs once lifted" || scenario_ok=false
+run_fleet refrozen "$(frozen_fleet 1.4.2)"
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs when frozen again" || scenario_ok=false
+finish_scenario
+
+run_scenario "server too old to report a freeze / silent"
+scenario_ok=true
+run_fleet oldserver "$(jq -n '{channels: [{channel: "dev", headVersion: "1.4.2"}], machines: []}')"
+assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs received" || scenario_ok=false
+finish_scenario
+
+run_scenario "pinned machine / pinned alert in place of stuck, deduped across targets"
+scenario_ok=true
+pinned_fleet() {
+  jq -n --arg target "$1" --arg at "$(epoch_to_iso $((now_epoch - 7200)))" '{channels: [{channel: "dev", headVersion: $target}], machines: [
+    {machineId: "m-pinned", name: "Claude9s-Mac-mini.local", orgId: "org-a", channel: "dev", online: true, updatePhase: "staged", updateTarget: $target, updateError: "updates disabled by kill-switch — staged, not applying", lastUpdateAt: $at}
+  ]}'
+}
+run_fleet pinned "$(pinned_fleet 1.4.2)"
+assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
+assert_contains "$output" "pinned-machine alarm posted to discord (1 machine(s))" "stdout" || scenario_ok=false
+assert_not_contains "$output" "stuck-phase alarm" "stdout" || scenario_ok=false
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs received" || scenario_ok=false
+posted_content=$(jq -r '.body.content' "$log_file")
+assert_contains "$posted_content" "pinned: Claude9s-Mac-mini.local (m-pinned) will not apply 1.4.2" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "updates.disabled-by-verify" "posted discord content" || scenario_ok=false
+run_fleet pinned "$(pinned_fleet 1.4.3)"
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs when only the target moved" || scenario_ok=false
+finish_scenario
+
+run_scenario "pin lifted / the machine leaves the pinned state"
+scenario_ok=true
+run_fleet unpinned "$(pinned_fleet 1.4.2)"
+run_fleet unpinned "$(jq -n '{channels: [{channel: "dev", headVersion: "1.4.2"}], machines: [
+  {machineId: "m-pinned", orgId: "org-a", channel: "dev", online: true, updatePhase: "good", updateTarget: "1.4.2"}
+]}')"
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs once lifted" || scenario_ok=false
+assert_eq "$(jq -c '.pinned' "${work_dir}/unpinned.state.json")" "{}" "pinned dedup state" || scenario_ok=false
+finish_scenario
+
+run_scenario "offline machine with a stale kill-switch note / not called pinned"
+scenario_ok=true
+run_fleet offlinepin "$(jq -n '{channels: [{channel: "dev", headVersion: "1.4.2"}], machines: [
+  {machineId: "m-gone", orgId: "org-a", channel: "dev", online: false, updatePhase: "good", updateTarget: "1.4.2", updateError: "updates disabled by kill-switch — staged, not applying"}
+]}')"
+assert_not_contains "$output" "pinned-machine alarm" "stdout" || scenario_ok=false
+finish_scenario
 
 echo "== ${pass_count} passed, ${fail_count} failed =="
 [ "$fail_count" -eq 0 ]
