@@ -246,7 +246,6 @@ while IFS= read -r machine; do
   # --- Signal 5: pinned (a staged update held behind the kill-switch). Named
   # for what it is, so it replaces the stuck alert rather than adding to it. ---
   if [ "$machine_online" = true ] && [ -n "$update_error" ] && echo "$update_error" | grep -Eiq "$PINNED_ERROR_PATTERN"; then
-    prev_target=$(echo "$new_state" | jq -r --arg id "$machine_id" '.pinned[$id].target // empty')
     prev_at=$(echo "$new_state" | jq -r --arg id "$machine_id" '.pinned[$id].alertedAt // empty')
     # Dedup by machine, not target: on a busy channel the target moves with every
     # publish, and the condition to act on has not changed.
@@ -386,7 +385,7 @@ if [ "$pinned_count" -gt 0 ]; then
   lines=("**SAW fleet pinned-machine alert**")
   while IFS= read -r line; do
     lines+=("$line")
-  done < <(echo "$pinned_offenders" | jq -r "$JQ_SAFE"'.[] | "- pinned: agent \(.machineId) will not apply \(.target | safe) — ~/.saw/updates.disabled-by-verify is on that machine; delete it unless the pin is still wanted"')
+  done < <(echo "$pinned_offenders" | jq -r "$JQ_SAFE"'.[] | "- pinned: agent \(.machineId) reports a kill-switch hold on \(.target | safe) — check ~/.saw/updates.disabled-by-verify on that machine and delete it unless the pin is still wanted. An agent older than SAW-4139 keeps this note after the file is gone, until its next update directive"')
   [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
   post_discord "$(printf '%s\n' "${lines[@]}")"
   echo "pinned-machine alarm posted to discord (${pinned_count} machine(s))"

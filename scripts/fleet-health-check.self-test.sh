@@ -480,7 +480,7 @@ assert_contains "$output" "pinned-machine alarm posted to discord (1 machine(s))
 assert_not_contains "$output" "stuck-phase alarm" "stdout" || scenario_ok=false
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs received" || scenario_ok=false
 posted_content=$(jq -r '.body.content' "$log_file")
-assert_contains "$posted_content" "pinned: agent m-pinned will not apply \`1.4.2\`" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "pinned: agent m-pinned reports a kill-switch hold on \`1.4.2\`" "posted discord content" || scenario_ok=false
 assert_not_contains "$posted_content" "Claude9s-Mac-mini" "the name its owner chose" || scenario_ok=false
 assert_contains "$posted_content" "updates.disabled-by-verify" "posted discord content" || scenario_ok=false
 run_fleet pinned "$(pinned_fleet 1.4.3)"
