@@ -44,6 +44,15 @@ assert_contains() {
   return 0
 }
 
+assert_not_contains() {
+  local haystack="$1" needle="$2" what="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "    FAIL: expected ${what} to NOT contain: ${needle}" >&2
+    return 1
+  fi
+  return 0
+}
+
 assert_eq() {
   local actual="$1" expected="$2" what="$3"
   if [ "$actual" != "$expected" ]; then
@@ -462,7 +471,59 @@ assert_contains "$output" "alarm posted to discord" "stdout" || scenario_ok=fals
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs received" || scenario_ok=false
 posted_content=$(jq -r '.body.content' "$log_file")
 assert_contains "$posted_content" "Desktop machines not converging" "posted discord content" || scenario_ok=false
-assert_contains "$posted_content" "m-desktop-2 stuck on 0.4.0" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "m-desktop-2 stuck on \`0.4.0\`" "posted discord content" || scenario_ok=false
+assert_eq "$(jq -c '.body.allowed_mentions' "$log_file")" '{"parse":[]}' "allowed_mentions" || scenario_ok=false
+if [ "$scenario_ok" = true ]; then
+  echo "    PASS"
+  pass_count=$((pass_count + 1))
+else
+  fail_count=$((fail_count + 1))
+fi
+
+# A machine reports its own version, so it must not render as markup or a mention.
+run_scenario "machine reporting a hostile version / alarm stays inert"
+port=$(free_port)
+config="${work_dir}/hostile_version.json"
+log_file="${work_dir}/hostile_version.discord.log"
+hostile_version='0.4.0
+**forged line** <@&123> [fix](https://evil.example)'
+manifest_url="http://127.0.0.1:${port}/manifest/dev-v0.9.1.json"
+releases=$(release_list "0.9.1" "$(epoch_to_iso $((now_epoch - 3600)))" "$manifest_url")
+manifest=$(manifest_body "0.9.1")
+fleet=$(fleet_envelope_with_desktop "0.9.1" "0.9.1" true \
+  "0.5.0" "$(epoch_to_iso $((now_epoch - 3600)))" "m-desktop-2" "$hostile_version" true)
+jq -n --argjson releases "$releases" --argjson manifest "$manifest" --argjson fleet "$fleet" '{
+  "GET /repos/LenderCom/saw-agent-releases/releases": {status: 200, body: $releases},
+  "GET /manifest/dev-v0.9.1.json": {status: 200, body: $manifest},
+  "GET /api/v1/platform/agent-fleet": {status: 200, body: $fleet},
+  "POST /channels/999/messages": {status: 200, body: {id: "7"}}
+}' > "$config"
+start_mock_server "$config" "$port" "$log_file"
+
+desktop_state_file="${work_dir}/hostile_version.desktop-state.json"
+jq -n --argjson at "$((now_epoch - 30 * 3600))" --arg v "$hostile_version" '{"m-desktop-2": {firstBehindAt: $at, version: $v}}' > "$desktop_state_file"
+
+set +e
+output=$(cd "$work_dir" && GITHUB_API_BASE="http://127.0.0.1:${port}" \
+  FLEET_ENDPOINT="http://127.0.0.1:${port}/api/v1/platform/agent-fleet" \
+  DISCORD_API_BASE="http://127.0.0.1:${port}" \
+  FLEET_KEY="test-fleet-key" \
+  DISCORD_BOT_TOKEN="test-bot-token" DISCORD_CHANNEL_ID="999" \
+  STATE_FILE="${work_dir}/hostile_version.state.json" \
+  DESKTOP_STATE_FILE="$desktop_state_file" \
+  RUN_URL="http://example.invalid/run/7" \
+  "$target_script" 2>&1)
+exit_code=$?
+set -e
+stop_mock_server
+
+scenario_ok=true
+assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
+posted_content=$(jq -r '.body.content' "$log_file")
+assert_contains "$posted_content" "m-desktop-2 stuck on" "posted discord content" || scenario_ok=false
+assert_not_contains "$posted_content" "**forged" "a forged line" || scenario_ok=false
+assert_not_contains "$posted_content" "<@" "a mention" || scenario_ok=false
+assert_not_contains "$posted_content" "](" "a masked link" || scenario_ok=false
 if [ "$scenario_ok" = true ]; then
   echo "    PASS"
   pass_count=$((pass_count + 1))
@@ -581,12 +642,12 @@ machine_channel_scenario() {
   fi
 }
 machine_channel_scenario "dev build on the stable channel / alarm" "0.1.3-dev.2438+g95a2e85c" stable \
-  "m-frozen stuck on 0.1.3-dev.2438+g95a2e85c for 0h (a dev build on the stable channel, not dev)"
+  "m-frozen stuck on \`0.1.3-dev.2438+g95a2e85c\` for 0h (a dev build on the \`stable\` channel, not dev)"
 machine_channel_scenario "stable build on the stable channel / silent" "0.1.2" stable ""
 machine_channel_scenario "dev build on the dev channel behind head / alarm" "0.9.1-dev.7+gabc1234" dev \
-  "m-frozen stuck on 0.9.1-dev.7+gabc1234 for 0h"
+  "m-frozen stuck on \`0.9.1-dev.7+gabc1234\` for 0h"
 machine_channel_scenario "stable build on the dev channel behind head / alarm" "0.1.2" dev \
-  "m-frozen stuck on 0.1.2 for 0h"
+  "m-frozen stuck on \`0.1.2\` for 0h"
 
 echo "== ${pass_count} passed, ${fail_count} failed =="
 [ "$fail_count" -eq 0 ]

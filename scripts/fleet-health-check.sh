@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reads the live agent fleet endpoint (the same platform-fleet feed
-# staleness-check.sh reads) and alarms on three per-machine signals that lane
-# staleness + convergence don't cover:
+# staleness-check.sh reads) and alarms on the signals that lane staleness +
+# convergence don't cover:
 #
 #   1. SECURITY — a machine's updateError indicates a genuinely tampered or
 #      corrupt manifest (bad-signature / a signature mismatch — the signer's
@@ -25,8 +25,22 @@
 #   3. STUCK — a machine sits in a non-terminal update phase (staged,
 #      draining, swapping, confirming) with lastUpdateAt older than the
 #      stuck threshold — it started an update and never finished.
+#   4. FROZEN — a channel is frozen: the plane sends no update directive on it
+#      until a higher version publishes, so any machine behind head just looks
+#      idle (SAW-4139). Keyed by channel + target. A server too old to report
+#      frozenTargetVersion reads as not frozen.
+#   5. PINNED — an online machine holds a staged update behind the kill-switch
+#      (~/.saw/updates.disabled-by-verify). It reports this instead of a stuck
+#      alert, since the stuck alert gives no reason and the fix is deleting a
+#      file on that machine, or leaving it if the pin is still wanted.
 #
 # Callable standalone (curl+jq only) or from a cron workflow.
+#
+# The ops channel trusts these alerts, and much of what they would quote is not
+# ours: a machine reports its own updateError and updateTarget, and a frozen
+# channel's target and reason come from those reports. Anything quoted goes
+# through jq's `safe` (JQ_SAFE below), and a machine is named only by its opaque
+# machineId, never the display name its owner chose.
 #
 # Dedup: alerts are tracked in STATE_FILE keyed by machineId. The SAME
 # machine + condition (same error string, or same stuck phase) re-alerts
@@ -44,6 +58,8 @@ STUCK_PHASE_MINUTES="${STUCK_PHASE_MINUTES:-30}"
 SECURITY_REALERT_HOURS="${SECURITY_REALERT_HOURS:-6}"
 OPS_REALERT_HOURS="${OPS_REALERT_HOURS:-6}"
 STUCK_REALERT_HOURS="${STUCK_REALERT_HOURS:-6}"
+FROZEN_REALERT_HOURS="${FROZEN_REALERT_HOURS:-6}"
+PINNED_REALERT_HOURS="${PINNED_REALERT_HOURS:-24}"
 DISCORD_API_BASE="${DISCORD_API_BASE:-https://discord.com/api/v10}"
 # Case-insensitive; genuine tamper/corruption only (verify.go
 # VerdictBadSignature / IManifestVerifier.cs BadSignature) — the manifest's
@@ -57,6 +73,12 @@ SECURITY_ERROR_PATTERN="${SECURITY_ERROR_PATTERN:-bad-signature|signature mismat
 # (rotation lag), never a security page.
 OPS_ERROR_PATTERN="${OPS_ERROR_PATTERN:-untrusted-key}"
 STUCK_PHASES="staged draining swapping confirming"
+# Case-insensitive; the note saw-agent reports while the kill-switch holds a
+# staged update (internal/update/drain.go).
+PINNED_ERROR_PATTERN="${PINNED_ERROR_PATTERN:-disabled by kill-switch}"
+# Renders reported text as one short inert line: no newline to forge an alert line
+# with, no markup or mention syntax, no URL, and a code span so it reads as a quote.
+JQ_SAFE='def safe: tostring | gsub("[^A-Za-z0-9 ._:,=+()-]"; "?") | .[0:200] | "`\(.)`";'
 
 # --- Self-failure notice (mirrors staleness-check.sh) ----------------------
 notified_self_failure=false
@@ -76,7 +98,7 @@ notify_self_failure() {
 Run: ${RUN_URL}"
 
   local payload notice_status
-  payload=$(jq -n --arg content "$text" '{content: $content}' 2>/dev/null) || return 0
+  payload=$(jq -n --arg content "$text" '{content: $content, allowed_mentions: {parse: []}}' 2>/dev/null) || return 0
   notice_status=$(curl -sS -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
     -H "Content-Type: application/json" \
@@ -125,7 +147,7 @@ post_discord() {
   require_env DISCORD_CHANNEL_ID SAW_OPS_DISCORD_CHANNEL_ID
 
   local payload response_file status
-  payload=$(jq -n --arg content "$message" '{content: $content}')
+  payload=$(jq -n --arg content "$message" '{content: $content, allowed_mentions: {parse: []}}')
   response_file=$(mktemp)
   status=$(curl -sS -o "$response_file" -w '%{http_code}' \
     -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
@@ -164,14 +186,16 @@ fleet_data=$(echo "$fleet_body" | jq -c '.data // .')
 if [ -f "$STATE_FILE" ]; then
   state=$(cat "$STATE_FILE")
 else
-  state='{"security":{},"ops":{},"stuck":{}}'
+  state='{"security":{},"ops":{},"stuck":{},"frozen":{},"pinned":{}}'
 fi
 # Tolerate a state file from before any of these keys existed.
-new_state=$(echo "$state" | jq -c '{security: (.security // {}), ops: (.ops // {}), stuck: (.stuck // {})}')
+new_state=$(echo "$state" | jq -c '{security: (.security // {}), ops: (.ops // {}), stuck: (.stuck // {}), frozen: (.frozen // {}), pinned: (.pinned // {})}')
 
 security_offenders="[]"
 ops_offenders="[]"
 stuck_offenders="[]"
+frozen_offenders="[]"
+pinned_offenders="[]"
 
 while IFS= read -r machine; do
   [ -z "$machine" ] && continue
@@ -180,6 +204,7 @@ while IFS= read -r machine; do
   update_target=$(echo "$machine" | jq -r '.updateTarget // "unknown"')
   update_phase=$(echo "$machine" | jq -r '.updatePhase // empty')
   last_update_at=$(echo "$machine" | jq -r '.lastUpdateAt // empty')
+  machine_online=$(echo "$machine" | jq -r 'if .online == false then "false" else "true" end')
 
   # --- Signal 1: security (genuine tamper/corruption — bad-signature) ---
   if [ -n "$update_error" ] && echo "$update_error" | grep -Eiq "$SECURITY_ERROR_PATTERN"; then
@@ -218,6 +243,28 @@ while IFS= read -r machine; do
     new_state=$(echo "$new_state" | jq --arg id "$machine_id" 'del(.security[$id]) | del(.ops[$id])')
   fi
 
+  # --- Signal 5: pinned (a staged update held behind the kill-switch). Named
+  # for what it is, so it replaces the stuck alert rather than adding to it. ---
+  if [ "$machine_online" = true ] && [ -n "$update_error" ] && echo "$update_error" | grep -Eiq "$PINNED_ERROR_PATTERN"; then
+    prev_at=$(echo "$new_state" | jq -r --arg id "$machine_id" '.pinned[$id].alertedAt // empty')
+    # Dedup by machine, not target: on a busy channel the target moves with every
+    # publish, and the condition to act on has not changed.
+    should_alert=true
+    if [ -n "$prev_at" ]; then
+      hours_since=$(( (now_epoch - prev_at) / 3600 ))
+      [ "$hours_since" -lt "$PINNED_REALERT_HOURS" ] && should_alert=false
+    fi
+    if [ "$should_alert" = true ]; then
+      pinned_offenders=$(echo "$pinned_offenders" | jq --arg id "$machine_id" --arg tgt "$update_target" \
+        '. + [{machineId: $id, target: $tgt}]')
+      new_state=$(echo "$new_state" | jq --arg id "$machine_id" --arg tgt "$update_target" --argjson now "$now_epoch" \
+        '.pinned[$id] = {target: $tgt, alertedAt: $now}')
+    fi
+    new_state=$(echo "$new_state" | jq --arg id "$machine_id" 'del(.stuck[$id])')
+    continue
+  fi
+  new_state=$(echo "$new_state" | jq --arg id "$machine_id" 'del(.pinned[$id])')
+
   # --- Signal 2: stuck (non-terminal phase, aged past the stuck threshold) ---
   is_stuck_phase=false
   for p in $STUCK_PHASES; do
@@ -249,19 +296,48 @@ while IFS= read -r machine; do
   fi
 done < <(echo "$fleet_data" | jq -c '(.machines // [])[]')
 
+# --- Signal 4: frozen channels (a platform fact, so outside the machine loop) ---
+frozen_now="{}"
+while IFS= read -r channel_row; do
+  [ -z "$channel_row" ] && continue
+  channel_name=$(echo "$channel_row" | jq -r '.channel')
+  frozen_target=$(echo "$channel_row" | jq -r '.frozenTargetVersion')
+  frozen_reason=$(echo "$channel_row" | jq -r '.frozenReason // "no reason recorded"')
+  prev_target=$(echo "$new_state" | jq -r --arg ch "$channel_name" '.frozen[$ch].target // empty')
+  prev_at=$(echo "$new_state" | jq -r --arg ch "$channel_name" '.frozen[$ch].alertedAt // empty')
+  alerted_at="$prev_at"
+  should_alert=true
+  if [ "$prev_target" = "$frozen_target" ] && [ -n "$prev_at" ]; then
+    hours_since=$(( (now_epoch - prev_at) / 3600 ))
+    [ "$hours_since" -lt "$FROZEN_REALERT_HOURS" ] && should_alert=false
+  fi
+  if [ "$should_alert" = true ]; then
+    frozen_offenders=$(echo "$frozen_offenders" | jq --arg ch "$channel_name" --arg tgt "$frozen_target" --arg why "$frozen_reason" \
+      '. + [{channel: $ch, target: $tgt, reason: $why}]')
+    alerted_at="$now_epoch"
+  fi
+  frozen_now=$(echo "$frozen_now" | jq --arg ch "$channel_name" --arg tgt "$frozen_target" --argjson at "$alerted_at" \
+    '.[$ch] = {target: $tgt, alertedAt: $at}')
+done < <(echo "$fleet_data" | jq -c '(.channels // [])[] | select(.frozenTargetVersion != null)')
+# Replaced outright, so a channel a higher publish has lifted alerts afresh next time.
+new_state=$(echo "$new_state" | jq --argjson frozen "$frozen_now" '.frozen = $frozen')
+
 # Drop dedup entries for machines the fleet no longer reports, so a
 # decommissioned machine's old alert state can't linger forever.
 present_ids=$(echo "$fleet_data" | jq -c '[(.machines // [])[].machineId]')
 new_state=$(echo "$new_state" | jq --argjson present "$present_ids" \
   '.security |= with_entries(select(.key as $k | $present | index($k) != null))
    | .ops |= with_entries(select(.key as $k | $present | index($k) != null))
-   | .stuck |= with_entries(select(.key as $k | $present | index($k) != null))')
+   | .stuck |= with_entries(select(.key as $k | $present | index($k) != null))
+   | .pinned |= with_entries(select(.key as $k | $present | index($k) != null))')
 
 echo "$new_state" > "$STATE_FILE"
 
 security_count=$(echo "$security_offenders" | jq 'length')
 ops_count=$(echo "$ops_offenders" | jq 'length')
 stuck_count=$(echo "$stuck_offenders" | jq 'length')
+frozen_count=$(echo "$frozen_offenders" | jq 'length')
+pinned_count=$(echo "$pinned_offenders" | jq 'length')
 
 # --- Alert (Discord) or stay silent -----------------------------------------
 
@@ -269,7 +345,7 @@ if [ "$security_count" -gt 0 ]; then
   lines=("**🚨 SAW fleet SECURITY alert**")
   while IFS= read -r line; do
     lines+=("$line")
-  done < <(echo "$security_offenders" | jq -r '.[] | "⚠️ SECURITY: agent \(.machineId) reported \(.error) for \(.target)"')
+  done < <(echo "$security_offenders" | jq -r "$JQ_SAFE"'.[] | "⚠️ SECURITY: agent \(.machineId) reported \(.error | safe) for \(.target | safe)"')
   [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
   post_discord "$(printf '%s\n' "${lines[@]}")"
   echo "security alarm posted to discord (${security_count} machine(s))"
@@ -279,7 +355,7 @@ if [ "$ops_count" -gt 0 ]; then
   lines=("**SAW fleet ops alert (key-rotation lag)**")
   while IFS= read -r line; do
     lines+=("$line")
-  done < <(echo "$ops_offenders" | jq -r '.[] | "ℹ️ ops: agent \(.machineId) reported untrusted-key for \(.target) — likely a key-rotation lag; ensure it updates"')
+  done < <(echo "$ops_offenders" | jq -r "$JQ_SAFE"'.[] | "ℹ️ ops: agent \(.machineId) reported untrusted-key for \(.target | safe) — likely a key-rotation lag; ensure it updates"')
   [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
   post_discord "$(printf '%s\n' "${lines[@]}")"
   echo "ops alarm posted to discord (${ops_count} machine(s))"
@@ -295,6 +371,26 @@ if [ "$stuck_count" -gt 0 ]; then
   echo "stuck-phase alarm posted to discord (${stuck_count} machine(s))"
 fi
 
-if [ "$security_count" -eq 0 ] && [ "$ops_count" -eq 0 ] && [ "$stuck_count" -eq 0 ]; then
-  echo "no security, ops, or stuck-phase issues detected"
+if [ "$frozen_count" -gt 0 ]; then
+  lines=("**SAW fleet frozen-channel alert**")
+  while IFS= read -r line; do
+    lines+=("$line")
+  done < <(echo "$frozen_offenders" | jq -r "$JQ_SAFE"'.[] | "- frozen: channel \(.channel | safe) at \(.target | safe) — no update directives until a higher version publishes (\(.reason | safe))"')
+  [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
+  post_discord "$(printf '%s\n' "${lines[@]}")"
+  echo "frozen-channel alarm posted to discord (${frozen_count} channel(s))"
+fi
+
+if [ "$pinned_count" -gt 0 ]; then
+  lines=("**SAW fleet pinned-machine alert**")
+  while IFS= read -r line; do
+    lines+=("$line")
+  done < <(echo "$pinned_offenders" | jq -r "$JQ_SAFE"'.[] | "- pinned: agent \(.machineId) reports a kill-switch hold on \(.target | safe) — check ~/.saw/updates.disabled-by-verify on that machine and delete it unless the pin is still wanted. An agent older than SAW-4139 keeps this note after the file is gone, until its next update directive"')
+  [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
+  post_discord "$(printf '%s\n' "${lines[@]}")"
+  echo "pinned-machine alarm posted to discord (${pinned_count} machine(s))"
+fi
+
+if [ "$security_count" -eq 0 ] && [ "$ops_count" -eq 0 ] && [ "$stuck_count" -eq 0 ] && [ "$frozen_count" -eq 0 ] && [ "$pinned_count" -eq 0 ]; then
+  echo "no security, ops, stuck-phase, frozen-channel, or pinned-machine issues detected"
 fi
