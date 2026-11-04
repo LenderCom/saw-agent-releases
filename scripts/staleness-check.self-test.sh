@@ -581,7 +581,7 @@ machine_channel_scenario() {
   fi
 }
 machine_channel_scenario "dev build on the stable channel / alarm" "0.1.3-dev.2438+g95a2e85c" stable \
-  "m-frozen stuck on 0.1.3-dev.2438+g95a2e85c for 0h (a dev build on the stable channel, which offers it no update)"
+  "m-frozen stuck on 0.1.3-dev.2438+g95a2e85c for 0h (a dev build on the stable channel, not dev)"
 machine_channel_scenario "stable build on the stable channel / silent" "0.1.2" stable ""
 machine_channel_scenario "dev build on the dev channel behind head / alarm" "0.9.1-dev.7+gabc1234" dev \
   "m-frozen stuck on 0.9.1-dev.7+gabc1234 for 0h"
