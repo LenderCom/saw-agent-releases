@@ -36,6 +36,12 @@
 #
 # Callable standalone (curl+jq only) or from a cron workflow.
 #
+# The ops channel trusts these alerts, and much of what they would quote is not
+# ours: a machine reports its own updateError and updateTarget, and a frozen
+# channel's target and reason come from those reports. Anything quoted goes
+# through jq's `safe` (JQ_SAFE below), and a machine is named only by its opaque
+# machineId, never the display name its owner chose.
+#
 # Dedup: alerts are tracked in STATE_FILE keyed by machineId. The SAME
 # machine + condition (same error string, or same stuck phase) re-alerts
 # only after REALERT_HOURS has passed, so a persisting condition doesn't
@@ -70,6 +76,9 @@ STUCK_PHASES="staged draining swapping confirming"
 # Case-insensitive; the note saw-agent reports while the kill-switch holds a
 # staged update (internal/update/drain.go).
 PINNED_ERROR_PATTERN="${PINNED_ERROR_PATTERN:-disabled by kill-switch}"
+# Renders reported text as one short inert line: no newline to forge an alert line
+# with, no markup or mention syntax, no URL, and a code span so it reads as a quote.
+JQ_SAFE='def safe: tostring | gsub("[^A-Za-z0-9 ._:,=+()-]"; "?") | .[0:200] | "`\(.)`";'
 
 # --- Self-failure notice (mirrors staleness-check.sh) ----------------------
 notified_self_failure=false
@@ -89,7 +98,7 @@ notify_self_failure() {
 Run: ${RUN_URL}"
 
   local payload notice_status
-  payload=$(jq -n --arg content "$text" '{content: $content}' 2>/dev/null) || return 0
+  payload=$(jq -n --arg content "$text" '{content: $content, allowed_mentions: {parse: []}}' 2>/dev/null) || return 0
   notice_status=$(curl -sS -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
     -H "Content-Type: application/json" \
@@ -138,7 +147,7 @@ post_discord() {
   require_env DISCORD_CHANNEL_ID SAW_OPS_DISCORD_CHANNEL_ID
 
   local payload response_file status
-  payload=$(jq -n --arg content "$message" '{content: $content}')
+  payload=$(jq -n --arg content "$message" '{content: $content, allowed_mentions: {parse: []}}')
   response_file=$(mktemp)
   status=$(curl -sS -o "$response_file" -w '%{http_code}' \
     -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
@@ -247,9 +256,8 @@ while IFS= read -r machine; do
       [ "$hours_since" -lt "$PINNED_REALERT_HOURS" ] && should_alert=false
     fi
     if [ "$should_alert" = true ]; then
-      machine_label=$(echo "$machine" | jq -r '.name // .machineId')
-      pinned_offenders=$(echo "$pinned_offenders" | jq --arg id "$machine_id" --arg name "$machine_label" --arg tgt "$update_target" \
-        '. + [{machineId: $id, name: $name, target: $tgt}]')
+      pinned_offenders=$(echo "$pinned_offenders" | jq --arg id "$machine_id" --arg tgt "$update_target" \
+        '. + [{machineId: $id, target: $tgt}]')
       new_state=$(echo "$new_state" | jq --arg id "$machine_id" --arg tgt "$update_target" --argjson now "$now_epoch" \
         '.pinned[$id] = {target: $tgt, alertedAt: $now}')
     fi
@@ -338,7 +346,7 @@ if [ "$security_count" -gt 0 ]; then
   lines=("**🚨 SAW fleet SECURITY alert**")
   while IFS= read -r line; do
     lines+=("$line")
-  done < <(echo "$security_offenders" | jq -r '.[] | "⚠️ SECURITY: agent \(.machineId) reported \(.error) for \(.target)"')
+  done < <(echo "$security_offenders" | jq -r "$JQ_SAFE"'.[] | "⚠️ SECURITY: agent \(.machineId) reported \(.error | safe) for \(.target | safe)"')
   [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
   post_discord "$(printf '%s\n' "${lines[@]}")"
   echo "security alarm posted to discord (${security_count} machine(s))"
@@ -348,7 +356,7 @@ if [ "$ops_count" -gt 0 ]; then
   lines=("**SAW fleet ops alert (key-rotation lag)**")
   while IFS= read -r line; do
     lines+=("$line")
-  done < <(echo "$ops_offenders" | jq -r '.[] | "ℹ️ ops: agent \(.machineId) reported untrusted-key for \(.target) — likely a key-rotation lag; ensure it updates"')
+  done < <(echo "$ops_offenders" | jq -r "$JQ_SAFE"'.[] | "ℹ️ ops: agent \(.machineId) reported untrusted-key for \(.target | safe) — likely a key-rotation lag; ensure it updates"')
   [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
   post_discord "$(printf '%s\n' "${lines[@]}")"
   echo "ops alarm posted to discord (${ops_count} machine(s))"
@@ -368,7 +376,7 @@ if [ "$frozen_count" -gt 0 ]; then
   lines=("**SAW fleet frozen-channel alert**")
   while IFS= read -r line; do
     lines+=("$line")
-  done < <(echo "$frozen_offenders" | jq -r '.[] | "- frozen: channel \(.channel) at \(.target) — no update directives until a higher version publishes (\(.reason))"')
+  done < <(echo "$frozen_offenders" | jq -r "$JQ_SAFE"'.[] | "- frozen: channel \(.channel | safe) at \(.target | safe) — no update directives until a higher version publishes (\(.reason | safe))"')
   [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
   post_discord "$(printf '%s\n' "${lines[@]}")"
   echo "frozen-channel alarm posted to discord (${frozen_count} channel(s))"
@@ -378,7 +386,7 @@ if [ "$pinned_count" -gt 0 ]; then
   lines=("**SAW fleet pinned-machine alert**")
   while IFS= read -r line; do
     lines+=("$line")
-  done < <(echo "$pinned_offenders" | jq -r '.[] | "- pinned: \(.name) (\(.machineId)) will not apply \(.target) — ~/.saw/updates.disabled-by-verify is on that machine; delete it unless the pin is still wanted"')
+  done < <(echo "$pinned_offenders" | jq -r "$JQ_SAFE"'.[] | "- pinned: agent \(.machineId) will not apply \(.target | safe) — ~/.saw/updates.disabled-by-verify is on that machine; delete it unless the pin is still wanted"')
   [ -n "$RUN_URL" ] && lines+=("Run: ${RUN_URL}")
   post_discord "$(printf '%s\n' "${lines[@]}")"
   echo "pinned-machine alarm posted to discord (${pinned_count} machine(s))"

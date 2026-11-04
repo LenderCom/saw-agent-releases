@@ -20,6 +20,9 @@ RUN_URL="${RUN_URL:-}"
 STALE_LANE_HOURS="${STALE_LANE_HOURS:-26}"
 CONVERGENCE_WINDOW_HOURS="${CONVERGENCE_WINDOW_HOURS:-24}"
 DISCORD_API_BASE="${DISCORD_API_BASE:-https://discord.com/api/v10}"
+# A machine reports its own version, and the ops channel trusts this alarm: render it
+# as one short inert line, the same as fleet-health-check.sh.
+JQ_SAFE='def safe: tostring | gsub("[^A-Za-z0-9 ._:,=+()-]"; "?") | .[0:200] | "`\(.)`";'
 
 # --- Self-failure notice ---------------------------------------------------
 # The whole point of this script is to be the thing that notices problems. If
@@ -45,7 +48,7 @@ notify_self_failure() {
 Run: ${RUN_URL}"
 
   local payload notice_status
-  payload=$(jq -n --arg content "$text" '{content: $content}' 2>/dev/null) || return 0
+  payload=$(jq -n --arg content "$text" '{content: $content, allowed_mentions: {parse: []}}' 2>/dev/null) || return 0
   notice_status=$(curl -sS -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
     -H "Content-Type: application/json" \
@@ -301,7 +304,7 @@ if [ "$lane_stale" = true ] || [ "$fleet_not_converging" = true ] || [ "$desktop
     lines+=("- Machines not converging to head (>= ${CONVERGENCE_WINDOW_HOURS}h behind):")
     while IFS= read -r line; do
       lines+=("$line")
-    done < <(echo "$stale_machines" | jq -r '.[] | "  - \(.machineId) stuck on \(.agentVersion) for \(.behindHours)h"')
+    done < <(echo "$stale_machines" | jq -r "$JQ_SAFE"'.[] | "  - \(.machineId) stuck on \(.agentVersion | safe) for \(.behindHours)h"')
   fi
   if [ "$desktop_head_stale" = true ]; then
     lines+=("- Desktop lane: ${desktop_head_reason}")
@@ -313,14 +316,14 @@ if [ "$lane_stale" = true ] || [ "$fleet_not_converging" = true ] || [ "$desktop
     lines+=("- Desktop machines not converging to head (>= ${CONVERGENCE_WINDOW_HOURS}h behind):")
     while IFS= read -r line; do
       lines+=("$line")
-    done < <(echo "$desktop_stale_machines" | jq -r '.[] | "  - \(.machineId) stuck on \(.appVersion) for \(.behindHours)h"')
+    done < <(echo "$desktop_stale_machines" | jq -r "$JQ_SAFE"'.[] | "  - \(.machineId) stuck on \(.appVersion | safe) for \(.behindHours)h"')
   fi
   if [ -n "$RUN_URL" ]; then
     lines+=("Run: ${RUN_URL}")
   fi
   message=$(printf '%s\n' "${lines[@]}")
 
-  payload=$(jq -n --arg content "$message" '{content: $content}')
+  payload=$(jq -n --arg content "$message" '{content: $content, allowed_mentions: {parse: []}}')
   discord_response_file=$(mktemp)
   discord_status=$(curl -sS -o "$discord_response_file" -w '%{http_code}' \
     -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \

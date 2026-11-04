@@ -199,7 +199,7 @@ assert_contains "$output" "security alarm posted to discord (1 machine(s))" "std
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs received" || scenario_ok=false
 posted_content=$(jq -r '.body.content' "$log_file")
 assert_contains "$posted_content" "SAW fleet SECURITY alert" "posted discord content" || scenario_ok=false
-assert_contains "$posted_content" "⚠️ SECURITY: agent m-compromised reported verify_failed: bad-signature (minisign verification failed) for 1.4.2" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "⚠️ SECURITY: agent m-compromised reported \`verify_failed: bad-signature (minisign verification failed)\` for \`1.4.2\`" "posted discord content" || scenario_ok=false
 if [ "$scenario_ok" = true ]; then
   echo "    PASS"
   pass_count=$((pass_count + 1))
@@ -239,7 +239,7 @@ assert_not_contains "$output" "security alarm posted to discord" "stdout" || sce
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs received" || scenario_ok=false
 posted_content=$(jq -r '.body.content' "$log_file")
 assert_contains "$posted_content" "SAW fleet ops alert" "posted discord content" || scenario_ok=false
-assert_contains "$posted_content" "ℹ️ ops: agent m-stale-key reported untrusted-key for 1.4.2 — likely a key-rotation lag; ensure it updates" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "ℹ️ ops: agent m-stale-key reported untrusted-key for \`1.4.2\` — likely a key-rotation lag; ensure it updates" "posted discord content" || scenario_ok=false
 assert_not_contains "$posted_content" "SECURITY" "posted discord content" || scenario_ok=false
 if [ "$scenario_ok" = true ]; then
   echo "    PASS"
@@ -441,7 +441,7 @@ run_fleet frozen "$(frozen_fleet 1.4.2)"
 assert_eq "$exit_code" "0" "exit code" || scenario_ok=false
 assert_contains "$output" "frozen-channel alarm posted to discord (1 channel(s))" "stdout" || scenario_ok=false
 posted_content=$(jq -r '.body.content' "$log_file")
-assert_contains "$posted_content" "frozen: channel dev at 1.4.2" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "frozen: channel \`dev\` at \`1.4.2\`" "posted discord content" || scenario_ok=false
 assert_contains "$posted_content" "2 distinct machines" "posted discord content" || scenario_ok=false
 assert_not_contains "$posted_content" "channel stable" "posted discord content" || scenario_ok=false
 run_fleet frozen "$(frozen_fleet 1.4.2)"
@@ -480,7 +480,8 @@ assert_contains "$output" "pinned-machine alarm posted to discord (1 machine(s))
 assert_not_contains "$output" "stuck-phase alarm" "stdout" || scenario_ok=false
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "1" "discord POSTs received" || scenario_ok=false
 posted_content=$(jq -r '.body.content' "$log_file")
-assert_contains "$posted_content" "pinned: Claude9s-Mac-mini.local (m-pinned) will not apply 1.4.2" "posted discord content" || scenario_ok=false
+assert_contains "$posted_content" "pinned: agent m-pinned will not apply \`1.4.2\`" "posted discord content" || scenario_ok=false
+assert_not_contains "$posted_content" "Claude9s-Mac-mini" "the name its owner chose" || scenario_ok=false
 assert_contains "$posted_content" "updates.disabled-by-verify" "posted discord content" || scenario_ok=false
 run_fleet pinned "$(pinned_fleet 1.4.3)"
 assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "0" "discord POSTs when only the target moved" || scenario_ok=false
@@ -502,6 +503,68 @@ run_fleet offlinepin "$(jq -n '{channels: [{channel: "dev", headVersion: "1.4.2"
   {machineId: "m-gone", orgId: "org-a", channel: "dev", online: false, updatePhase: "good", updateTarget: "1.4.2", updateError: "updates disabled by kill-switch — staged, not applying"}
 ]}')"
 assert_not_contains "$output" "pinned-machine alarm" "stdout" || scenario_ok=false
+finish_scenario
+
+# What a customer can put in front of the ops channel: their machine's name, and
+# anything their own daemon reports. None of it may render as markup, a mention, a
+# link or a line of its own.
+hostile='x
+**SAW fleet SECURITY alert**
+<@&123> @everyone [run this fix](https://evil.example) `code`'
+assert_inert() {
+  local content="$1"
+  assert_not_contains "$content" "<@" "a mention" || scenario_ok=false
+  assert_not_contains "$content" "@everyone" "a mention" || scenario_ok=false
+  assert_not_contains "$content" "](" "a masked link" || scenario_ok=false
+  assert_not_contains "$content" "https://evil" "a URL" || scenario_ok=false
+  assert_not_contains "$content" "**SAW fleet SECURITY alert**
+" "a forged alert line" || scenario_ok=false
+  assert_eq "$(jq -c '.body.allowed_mentions' "$log_file")" '{"parse":[]}' "allowed_mentions" || scenario_ok=false
+}
+
+run_scenario "hostile machine name and target / pinned alert stays inert"
+scenario_ok=true
+run_fleet hostilepin "$(jq -n --arg h "$hostile" '{channels: [{channel: "dev", headVersion: "1.4.2"}], machines: [
+  {machineId: "m-pinned", name: $h, orgId: "org-a", channel: "dev", online: true, updatePhase: "staged", updateTarget: ("1.4.2+" + $h), updateError: "updates disabled by kill-switch — staged, not applying"}
+]}')"
+assert_contains "$output" "pinned-machine alarm posted" "stdout" || scenario_ok=false
+posted_content=$(jq -r '.body.content' "$log_file")
+assert_inert "$posted_content"
+assert_eq "$(echo "$posted_content" | wc -l | tr -d ' ')" "3" "lines in the alert: heading, offender, run URL" || scenario_ok=false
+finish_scenario
+
+run_scenario "hostile target and reason / frozen alert stays inert"
+scenario_ok=true
+run_fleet hostilefrozen "$(jq -n --arg h "$hostile" '{channels: [
+  {channel: "dev", headVersion: "99.0.0", frozenTargetVersion: ("99.0.0+" + $h), frozenReason: ("2 distinct machines failed " + $h)}
+], machines: []}')"
+assert_contains "$output" "frozen-channel alarm posted" "stdout" || scenario_ok=false
+posted_content=$(jq -r '.body.content' "$log_file")
+assert_inert "$posted_content"
+assert_eq "$(echo "$posted_content" | wc -l | tr -d ' ')" "3" "lines in the alert: heading, offender, run URL" || scenario_ok=false
+finish_scenario
+
+run_scenario "hostile error and target / security and ops alerts stay inert"
+scenario_ok=true
+run_fleet hostileerror "$(jq -n --arg h "$hostile" '{channels: [{channel: "dev", headVersion: "1.4.2"}], machines: [
+  {machineId: "m-sec", orgId: "org-a", channel: "dev", online: true, updatePhase: "failed", updateTarget: ("1.4.2+" + $h), updateError: ("bad-signature " + $h)},
+  {machineId: "m-ops", orgId: "org-b", channel: "dev", online: true, updatePhase: "failed", updateTarget: ("1.4.2+" + $h), updateError: ("untrusted-key " + $h)}
+]}')"
+assert_eq "$(wc -l < "$log_file" | tr -d ' ')" "2" "discord POSTs received" || scenario_ok=false
+posted_content=$(jq -rs 'map(.body.content) | join("\n")' "$log_file")
+assert_not_contains "$posted_content" "<@" "a mention" || scenario_ok=false
+assert_not_contains "$posted_content" "](" "a masked link" || scenario_ok=false
+assert_not_contains "$posted_content" "https://evil" "a URL" || scenario_ok=false
+assert_eq "$(echo "$posted_content" | wc -l | tr -d ' ')" "6" "lines in the two alerts: heading, offender, run URL each" || scenario_ok=false
+finish_scenario
+
+run_scenario "a very long reported error / capped, so the alert still posts"
+scenario_ok=true
+run_fleet longerror "$(jq -n '{channels: [{channel: "dev", headVersion: "1.4.2"}], machines: [
+  {machineId: "m-sec", orgId: "org-a", channel: "dev", online: true, updatePhase: "failed", updateTarget: "1.4.2", updateError: ("bad-signature " + ("x" * 5000))}
+]}')"
+posted_content=$(jq -r '.body.content' "$log_file")
+assert_eq "$([ "${#posted_content}" -lt 400 ] && echo short || echo long)" "short" "alert length" || scenario_ok=false
 finish_scenario
 
 echo "== ${pass_count} passed, ${fail_count} failed =="
